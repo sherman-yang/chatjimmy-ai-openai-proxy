@@ -12,10 +12,27 @@ const UPSTREAM_CHAT_PATH = process.env.UPSTREAM_CHAT_PATH ?? "/api/chat";
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY ?? "";
 const DEFAULT_SYSTEM_PROMPT = process.env.CHATJIMMY_SYSTEM_PROMPT ?? "";
-const DEFAULT_TOP_K = Number.parseInt(process.env.CHATJIMMY_TOP_K ?? "8", 10);
+const DEFAULT_TOP_K = (() => {
+  const raw = process.env.CHATJIMMY_TOP_K;
+  if (raw == null || raw.trim() === "") {
+    return null;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : null;
+})();
+const MODELS_CACHE_TTL_MS = (() => {
+  const parsed = Number.parseInt(process.env.MODELS_CACHE_TTL_MS ?? "30000", 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 30000;
+})();
 
 const STATS_START = "<|stats|>";
 const STATS_END = "<|/stats|>";
+
+const modelsCache = {
+  payload: null,
+  fetchedAt: 0,
+  inflight: null,
+};
 
 function json(res, statusCode, payload) {
   const body = JSON.stringify(payload);
@@ -213,6 +230,14 @@ function usageFromStats(stats) {
   return undefined;
 }
 
+function parseTopK(value) {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return null;
+  }
+  return Math.floor(parsed);
+}
+
 async function readJsonBody(req) {
   const chunks = [];
   let size = 0;
@@ -266,17 +291,22 @@ function buildUpstreamPayload(openAiBody, model) {
     .filter((value) => typeof value === "string" && value.trim().length > 0)
     .join("\n\n");
 
-  const topKInput = Number(passthroughChatOptions.topK ?? DEFAULT_TOP_K);
-  const topK = Number.isFinite(topKInput) && topKInput >= 1 ? Math.floor(topKInput) : 1;
+  const topKFromRequest = parseTopK(passthroughChatOptions.topK);
+  const topK = topKFromRequest ?? DEFAULT_TOP_K;
+  const chatOptions = {
+    ...passthroughChatOptions,
+    selectedModel: model,
+    systemPrompt: mergedPrompt,
+  };
+  if (topK != null) {
+    chatOptions.topK = topK;
+  } else {
+    delete chatOptions.topK;
+  }
 
   return {
     messages,
-    chatOptions: {
-      ...passthroughChatOptions,
-      selectedModel: model,
-      systemPrompt: mergedPrompt,
-      topK,
-    },
+    chatOptions,
     attachment:
       openAiBody.attachment && typeof openAiBody.attachment === "object"
         ? openAiBody.attachment
@@ -418,11 +448,7 @@ async function streamToOpenAi(res, upstreamResponse, options) {
   res.end();
 }
 
-async function handleModelsList(req, res) {
-  if (!requireAuth(req, res)) {
-    return;
-  }
-
+async function fetchModelsPayloadFromUpstream() {
   const upstream = await fetchUpstream(UPSTREAM_MODELS_PATH, {
     method: "GET",
     headers: {
@@ -439,15 +465,55 @@ async function handleModelsList(req, res) {
     } catch {
       // Keep raw message.
     }
-    openAiError(res, upstream.status, message);
-    return;
+    const error = new Error(message);
+    error.statusCode = upstream.status;
+    throw error;
   }
 
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const error = new Error("Upstream models response is not valid JSON");
+    error.statusCode = 502;
+    throw error;
+  }
+}
+
+async function getModelsPayload() {
+  const now = Date.now();
+  if (
+    modelsCache.payload &&
+    MODELS_CACHE_TTL_MS > 0 &&
+    now - modelsCache.fetchedAt <= MODELS_CACHE_TTL_MS
+  ) {
+    return modelsCache.payload;
+  }
+
+  if (modelsCache.inflight) {
+    return modelsCache.inflight;
+  }
+
+  modelsCache.inflight = (async () => {
+    const payload = await fetchModelsPayloadFromUpstream();
+    modelsCache.payload = payload;
+    modelsCache.fetchedAt = Date.now();
+    return payload;
+  })().finally(() => {
+    modelsCache.inflight = null;
+  });
+
+  return modelsCache.inflight;
+}
+
+async function handleModelsList(req, res) {
+  if (!requireAuth(req, res)) {
+    return;
+  }
   let payload;
   try {
-    payload = JSON.parse(raw);
-  } catch {
-    openAiError(res, 502, "Upstream models response is not valid JSON", "api_error");
+    payload = await getModelsPayload();
+  } catch (error) {
+    openAiError(res, error?.statusCode ?? 502, error?.message ?? "Failed to fetch models", "api_error");
     return;
   }
 
@@ -458,15 +524,13 @@ async function handleModelById(req, res, modelId) {
   if (!requireAuth(req, res)) {
     return;
   }
-
-  const upstream = await fetchUpstream(UPSTREAM_MODELS_PATH, {
-    method: "GET",
-    headers: {
-      accept: "application/json",
-    },
-  });
-
-  const payload = await upstream.json().catch(() => null);
+  let payload;
+  try {
+    payload = await getModelsPayload();
+  } catch (error) {
+    openAiError(res, error?.statusCode ?? 502, error?.message ?? "Failed to fetch models", "api_error");
+    return;
+  }
   const model = payload?.data?.find((item) => item?.id === modelId);
   if (!model) {
     openAiError(res, 404, `Model '${modelId}' not found`, "invalid_request_error", "model_not_found");
@@ -635,6 +699,27 @@ const server = http.createServer(async (req, res) => {
     console.error("Unhandled proxy error:", error);
     openAiError(res, 500, "Internal proxy error", "api_error", "internal_error");
   }
+});
+
+server.on("error", (error) => {
+  if (error?.code === "EADDRINUSE") {
+    console.error(`Error: address ${HOST}:${PORT} is already in use.`);
+    console.error("How to fix:");
+    console.error(`  1) Stop the process listening on port ${PORT}.`);
+    console.error("  2) Or change PORT in .env and restart the proxy.");
+    process.exit(1);
+    return;
+  }
+
+  if (error?.code === "EACCES") {
+    console.error(`Error: no permission to bind ${HOST}:${PORT}.`);
+    console.error("Try a higher port (for example 3000 or 3011).");
+    process.exit(1);
+    return;
+  }
+
+  console.error("Server failed to start:", error);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

@@ -19,6 +19,20 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+if command -v lsof >/dev/null 2>&1; then
+  LISTENER_INFO="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -n "$LISTENER_INFO" ]]; then
+    echo "Error: port $PORT is already in use."
+    echo
+    echo "$LISTENER_INFO"
+    echo
+    echo "How to fix:"
+    echo "  1) Stop the process that is listening on port $PORT."
+    echo "  2) Or set a different PORT in .env, then run ./start.sh again."
+    exit 1
+  fi
+fi
+
 DISPLAY_HOST="$HOST"
 if [[ "$HOST" == "0.0.0.0" || "$HOST" == "::" ]]; then
   DISPLAY_HOST="127.0.0.1"
@@ -34,6 +48,12 @@ echo "Bind Host : $HOST"
 echo "Port      : $PORT"
 echo "API Base  : $API_BASE"
 echo "Health    : $BASE_URL/healthz"
+if [[ -n "${CHATJIMMY_TOP_K:-}" ]]; then
+  echo "Default topK: $CHATJIMMY_TOP_K"
+else
+  echo "Default topK: upstream default"
+fi
+echo "Models cache TTL: ${MODELS_CACHE_TTL_MS:-30000} ms"
 echo
 echo "Available API paths:"
 echo "  GET  /v1/models"

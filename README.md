@@ -33,6 +33,16 @@ node -v
 
 Default listen address: `http://0.0.0.0:3000`
 
+### Speed tuning knobs
+
+- `CHATJIMMY_TOP_K`
+  - lower is usually faster (for example `1`)
+  - if unset, upstream default behavior is used
+- `MODELS_CACHE_TTL_MS`
+  - caches `/v1/models` responses in memory (default `30000` ms)
+  - reduces repeated upstream calls for model list traffic
+- Use `stream: true` for better perceived latency (first token arrives earlier).
+
 ## 3. Supported API
 
 - `GET /v1/models`
